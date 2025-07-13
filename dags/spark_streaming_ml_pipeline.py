@@ -1,67 +1,82 @@
 from airflow import DAG
 from airflow.operators.bash import BashOperator
-from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.operators.python import BranchPythonOperator
 from airflow.operators.email import EmailOperator
-from airflow.sensors.filesystem import FileSensor
 from datetime import datetime
-import random
+import os, textwrap
 
-default_args = {"start_date": datetime(2024, 1, 1)}
-
-def should_register():
-    # Gerçek durumda burada accuracy karşılaştırması olur
-    return "register_model" if random.random() > 0.5 else "notify_team"
+default_args = {"start_date": datetime(2025, 1, 1)}
 
 with DAG(
-    dag_id="spark_streaming_ml_pipeline",
-    schedule_interval="@once",
+    dag_id="kafka_spark_mlflow_pipeline",
+    schedule_interval="@daily",
     default_args=default_args,
-    catchup=False
+    catchup=False,
 ) as dag:
 
-    create_kafka_topic = BashOperator(
+    # 0) (Opsiyonel) Kafka topic’i oluştur
+    create_topic = BashOperator(
         task_id="create_kafka_topic",
-        bash_command="kubectl exec -it $(kubectl get pods -l app=kafka -o jsonpath='{.items[0].metadata.name}') -- bash -c \"/opt/kafka/bin/kafka-topics.sh --create --topic realtime-sales --bootstrap-server localhost:9092 --replication-factor 1 --partitions 1\""
+        bash_command=textwrap.dedent("""
+          set -e
+          kubectl exec -it $(kubectl get pods -l app=kafka -o jsonpath='{.items[0].metadata.name}') -- \
+          /opt/kafka/bin/kafka-topics.sh --create --if-not-exists \
+            --topic realtime-sales --bootstrap-server localhost:9092 \
+            --replication-factor 1 --partitions 1
+        """)
     )
 
-    wait_for_trigger = FileSensor(
-        task_id="wait_for_trigger",
-        filepath="/opt/airflow/dags/data/trigger.txt",  # örnek tetik dosyası
-        poke_interval=10,
-        timeout=600
+    preprocess = SparkSubmitOperator(
+        task_id="spark_preprocess",
+        application="/opt/spark_jobs/preprocessing.py",
+        name="kafka_preprocess",
+        conn_id="spark_k8s",          # Airflow Connection tanımı
+        conf={
+            "spark.kubernetes.container.image": "my-spark:latest",
+            "spark.executor.instances": "2",
+        },
+        env_vars={
+            "KAFKA_BOOTSTRAP": os.getenv("KAFKA_BOOTSTRAP"),
+            "PG_JDBC_URL": os.getenv("PG_JDBC_URL"),
+            "PG_USER": os.getenv("PG_USER"),
+            "PG_PW": os.getenv("PG_PW"),
+        },
+        verbose=True,
     )
 
-    run_spark_job = BashOperator(
-        task_id="run_spark_job",
-        bash_command="spark-submit --master spark://spark-master:7077 /opt/airflow/dags/streaming.py"
+    train = SparkSubmitOperator(
+        task_id="spark_train",
+        application="/opt/spark_jobs/training.py",
+        name="train_gbt",
+        conn_id="spark_k8s",
+        conf={"spark.kubernetes.container.image": "my-spark:latest"},
+        env_vars={
+            "PG_JDBC_URL": os.getenv("PG_JDBC_URL"),
+            "PG_USER": os.getenv("PG_USER"),
+            "PG_PW": os.getenv("PG_PW"),
+            "MLFLOW_TRACKING_URI": os.getenv("MLFLOW_TRACKING_URI"),
+        },
+        verbose=True,
     )
 
-    train_model = BashOperator(
-        task_id="train_model",
-        bash_command="python3 /opt/airflow/dags/train_model.py"
-    )
-
-    evaluate_model = BashOperator(
-        task_id="evaluate_model",
-        bash_command="python3 /opt/airflow/dags/evaluate_model.py"
-    )
-
-    check_accuracy = BranchPythonOperator(
-        task_id="check_accuracy",
-        python_callable=should_register
+    check_eval = BranchPythonOperator(
+        task_id="check_evaluation",
+        python_callable=__import__("scripts.check_evaluation").check_evaluation.should_register,
+        provide_context=True,
     )
 
     register_model = BashOperator(
         task_id="register_model",
-        bash_command="python3 /opt/airflow/dags/register_model.py"
+        bash_command="echo '✔️  Model approved & registered!'"
     )
 
     notify_team = EmailOperator(
         task_id="notify_team",
-        to="data-team@example.com",
-        subject="Model Eğitimi Tamamlandı",
-        html_content="Model başarıyla eğitildi ya da kayıt edilmedi. Kontrol edin."
+        to="ml-team@example.com",
+        subject="Model retraining failed threshold",
+        html_content="Yeni run istenen RMSE eşiğini geçemedi.",
     )
 
-    create_kafka_topic >> wait_for_trigger >> run_spark_job >> train_model >> evaluate_model >> check_accuracy
-    check_accuracy >> [register_model, notify_team]
+    create_topic >> preprocess >> train >> check_eval
+    check_eval >> [register_model, notify_team]
